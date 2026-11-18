@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clockify-mcp"
+version = "0.1.0"
+description = "A small MCP server for reading and writing your own Clockify time entries"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2,<3",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+clockify-mcp = "clockify_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/clockify_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
