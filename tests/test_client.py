@@ -39,8 +39,24 @@ class FakeClockify:
             return httpx.Response(self.status_override, json={"message": "nope"})
         if path == "/user":
             return httpx.Response(200, json=USER)
+        if path == "/workspaces":
+            return httpx.Response(200, json=[
+                {"id": WS, "name": "RISE", "featureSubscriptionType": "STANDARD"},
+                {"id": "ws2", "name": "Private", "featureSubscriptionType": "FREE_2026"},
+            ])
+        if path == "/workspaces/ws2/projects":
+            return httpx.Response(200, json=[{"id": "q1", "name": "Hobby", "archived": False}])
+        if path == f"/workspaces/{WS}/projects" and request.method == "POST":
+            client_name = {"c1": "Energimyndigheten"}.get(body.get("clientId"), "")
+            return httpx.Response(
+                201, json={"id": "new1", "name": body["name"], "clientName": client_name, "archived": False}
+            )
         if path == f"/workspaces/{WS}/projects":
             return httpx.Response(200, json=PROJECTS)
+        if path == f"/workspaces/{WS}/clients":
+            wanted = request.url.params.get("name", "").casefold()
+            clients = [{"id": "c1", "name": "Energimyndigheten"}, {"id": "c2", "name": "EU"}]
+            return httpx.Response(200, json=[c for c in clients if wanted in c["name"].casefold()])
         if path == f"/workspaces/{WS}/user/u1/time-entries":
             self.last_params = dict(request.url.params)
             return httpx.Response(200, json=list(self.entries.values()))
@@ -82,6 +98,7 @@ def client(fake, tmp_path):
         "test-key",
         api_url="https://api.clockify.me/api/v1",
         usage_file=tmp_path / "requests.json",
+        config_file=tmp_path / "config.json",
         transport=httpx.MockTransport(fake),
     )
 
@@ -112,6 +129,36 @@ def test_user_and_projects_are_cached(client, fake):
     assert paths.count("/user") == 1
     assert paths.count(f"/workspaces/{WS}/projects") == 1
     assert client.requests.count() == 4
+
+
+def test_create_project_without_client(client, fake):
+    project = client.create_project("P128953 BARON")
+    method, path, body = fake.calls[-1]
+    assert (method, path) == ("POST", f"/workspaces/{WS}/projects")
+    assert body == {"name": "P128953 BARON"}
+    assert project.id == "new1"
+    # The new project is added to the cache, so it resolves without another request.
+    before = client.requests.count()
+    assert client.resolve_project("P128953").id == "new1"
+    assert client.requests.count() == before
+
+
+def test_create_project_with_client(client, fake):
+    project = client.create_project("P129999 Test", client="energimyndigheten")
+    assert fake.calls[-1][2] == {"name": "P129999 Test", "clientId": "c1"}
+    assert project.client == "Energimyndigheten"
+
+
+def test_create_project_unknown_client_makes_no_post(client, fake):
+    with pytest.raises(ClockifyError, match="Expected one client"):
+        client.create_project("P129999 Test", client="Nobody")
+    assert not [c for c in fake.calls if c[0] == "POST"]
+
+
+def test_create_project_refuses_duplicate(client, fake):
+    with pytest.raises(ClockifyError, match="already exists \\(archived"):
+        client.create_project("baltic old")
+    assert not [c for c in fake.calls if c[0] == "POST"]
 
 
 def test_resolve_project(client):
@@ -195,3 +242,57 @@ def test_request_log_persists(client, tmp_path):
     from clockify_mcp.client import RequestLog
 
     assert RequestLog(tmp_path / "requests.json").count() == 1
+
+
+def make_client(fake, tmp_path):
+    return ClockifyClient(
+        "test-key",
+        api_url="https://api.clockify.me/api/v1",
+        usage_file=tmp_path / "requests.json",
+        config_file=tmp_path / "config.json",
+        transport=httpx.MockTransport(fake),
+    )
+
+
+def test_limit_before_subscription_is_known(client):
+    assert client.subscription is None
+    assert client.hourly_limit == 30
+
+
+def test_list_workspaces_saves_subscriptions(client, fake, tmp_path):
+    items = client.workspaces()
+    assert [w["name"] for w in items] == ["RISE", "Private"]
+    assert items[0]["subscription"] == "STANDARD"
+    client.workspaces()
+    assert [c[1] for c in fake.calls].count("/workspaces") == 1
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert saved["workspaces"][WS] == {"name": "RISE", "subscription": "STANDARD"}
+
+
+def test_limit_follows_subscription(client):
+    client.workspaces()
+    client.select_workspace("RISE")
+    assert client.subscription == "STANDARD" and client.hourly_limit is None
+    client.select_workspace("Private")
+    assert client.subscription == "FREE_2026" and client.hourly_limit == 30
+
+
+def test_select_workspace_switches_projects_and_persists(client, fake, tmp_path, monkeypatch):
+    monkeypatch.delenv("CLOCKIFY_WORKSPACE_ID", raising=False)
+    assert client.resolve_project("p1").name == "TRANS4M-R"
+    chosen = client.select_workspace("priv")
+    assert chosen["id"] == "ws2" and chosen["hourly_limit"] == 30
+    assert client.resolve_project("Hobby").id == "q1"
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert saved["workspace"] == "ws2"
+    # A new client (a restart) knows the workspace and its limit without asking Clockify.
+    again = make_client(fake, tmp_path)
+    calls = len(fake.calls)
+    assert again.workspace_id == "ws2"
+    assert again.subscription == "FREE_2026" and again.hourly_limit == 30
+    assert len(fake.calls) == calls
+
+
+def test_select_unknown_workspace(client):
+    with pytest.raises(ClockifyError, match="matches no workspaces"):
+        client.select_workspace("nope")

@@ -11,6 +11,7 @@ from .client import (
     FREE_PLAN_HOURLY_LIMIT,
     ClockifyClient,
     ClockifyError,
+    hourly_limit_for,
     load_api_key,
     summarize,
 )
@@ -18,11 +19,13 @@ from .client import (
 mcp = MCPServer(
     "clockify",
     instructions=(
-        "Tools for the user's own Clockify time entries. The free plan can be limited "
-        f"to {FREE_PLAN_HOURLY_LIMIT} API requests per hour for the whole workspace, so "
-        "plan calls: each add, update or delete costs one or two requests. Check "
-        "clockify_status before a larger batch. Dates are YYYY-MM-DD and times HH:MM "
-        "in the user's Clockify time zone."
+        "Tools for the user's own Clockify time entries. A workspace whose Clockify "
+        "subscription is free (or not known yet) is treated as limited to "
+        f"{FREE_PLAN_HOURLY_LIMIT} API requests per hour; other subscriptions are not. Every "
+        "result reports api_usage; when hourly_limit is set, plan calls (each add, "
+        "update or delete costs one or two requests) and check clockify_status before "
+        "a larger batch. Use list_workspaces and select_workspace to work in another "
+        "workspace. Dates are YYYY-MM-DD and times HH:MM in the user's Clockify time zone."
     ),
 )
 
@@ -37,11 +40,14 @@ def client() -> ClockifyClient:
 
 
 def _usage() -> dict[str, Any]:
-    used = client().requests.count()
+    c = client()
+    used = c.requests.count()
+    limit = c.hourly_limit
     return {
         "requests_last_hour": used,
-        "free_plan_hourly_limit": FREE_PLAN_HOURLY_LIMIT,
-        "remaining_if_limited": max(0, FREE_PLAN_HOURLY_LIMIT - used),
+        "subscription": c.subscription,
+        "hourly_limit": limit,  # None means no limit for this subscription
+        "remaining": None if limit is None else max(0, limit - used),
     }
 
 
@@ -54,17 +60,55 @@ def _fail(exc: ClockifyError) -> ToolError:
 def clockify_status() -> dict[str, Any]:
     """Show the Clockify user, workspace, time zone and API requests used in the last hour.
 
-    Costs one request the first time it is called in a session, none after that.
+    Costs one request the first time it is called in a session, plus one if the
+    workspace's subscription type is not known yet; none after that.
     """
     try:
         c = client()
         user = c.user()
+        if c.subscription is None:
+            c.workspaces()
         return {
             "user": user.get("name"),
             "workspace_id": c.workspace_id,
             "time_zone": str(c.tz),
             "api_usage": _usage(),
         }
+    except ClockifyError as exc:
+        raise _fail(exc)
+
+
+@mcp.tool()
+def list_workspaces(refresh: bool = False) -> dict[str, Any]:
+    """List the user's Clockify workspaces and show which one the tools use.
+
+    Each workspace shows its Clockify subscription type and the hourly request
+    limit that follows from it (free: 30, others: none). The answer is saved, so
+    the limit is known after a restart. Costs one request the first time (cached
+    for the session; refresh to fetch again, for example after an upgrade).
+    """
+    try:
+        c = client()
+        current = c.workspace_id
+        items = [
+            {**w, "hourly_limit": hourly_limit_for(w["subscription"]), "in_use": w["id"] == current}
+            for w in c.workspaces(refresh=refresh)
+        ]
+        return {"workspaces": items, "api_usage": _usage()}
+    except ClockifyError as exc:
+        raise _fail(exc)
+
+
+@mcp.tool()
+def select_workspace(workspace: str) -> dict[str, Any]:
+    """Make the tools use another workspace, given by id or (part of) its name.
+
+    The choice is saved and kept after a restart (unless CLOCKIFY_WORKSPACE_ID is
+    set). Clockify's own active workspace is not changed. Costs one request if the workspace list is not cached.
+    """
+    try:
+        chosen = client().select_workspace(workspace)
+        return {"selected": chosen, "api_usage": _usage()}
     except ClockifyError as exc:
         raise _fail(exc)
 
@@ -80,6 +124,29 @@ def list_projects(include_archived: bool = False, refresh: bool = False) -> dict
         shown = [p.as_dict() for p in projects if include_archived or not p.archived]
         shown.sort(key=lambda p: p["name"].casefold())
         return {"projects": shown, "api_usage": _usage()}
+    except ClockifyError as exc:
+        raise _fail(exc)
+
+
+@mcp.tool()
+def create_project(
+    name: str,
+    client_name: str = "",
+    is_public: bool | None = None,
+    billable: bool | None = None,
+) -> dict[str, Any]:
+    """Create a project in the workspace.
+
+    Refuses a name that already exists (checked against the cached project list).
+    client_name must match an existing client exactly; it is not created.
+    Costs one request, plus one to look up the client if given, plus one to load
+    the project list if it is not cached yet.
+    """
+    try:
+        project = client().create_project(
+            name, client=client_name, is_public=is_public, billable=billable
+        )
+        return {"created": project.as_dict(), "api_usage": _usage()}
     except ClockifyError as exc:
         raise _fail(exc)
 

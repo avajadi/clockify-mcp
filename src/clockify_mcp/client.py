@@ -1,8 +1,9 @@
 """Thin Clockify REST client, built to be frugal with API requests.
 
-The free plan can be limited to 30 requests per hour for the whole workspace,
-so the client caches the user and the project list, and keeps a persistent
-count of the requests it has made during the last hour.
+A workspace on the free plan can be limited to 30 requests per hour, so the
+client caches the user and the project list, and keeps a persistent count of
+the requests it has made during the last hour. The hourly limit follows the
+subscription type Clockify reports for the workspace (see hourly_limit_for).
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import httpx
 DEFAULT_API_URL = "https://api.clockify.me/api/v1"
 DEFAULT_KEY_FILE = Path.home() / ".config" / "clockify-mcp" / "api-key"
 DEFAULT_USAGE_FILE = Path.home() / ".cache" / "clockify-mcp" / "requests.json"
+DEFAULT_CONFIG_FILE = Path.home() / ".config" / "clockify-mcp" / "config.json"
 FREE_PLAN_HOURLY_LIMIT = 30
 PAGE_SIZE = 200
 
@@ -44,6 +46,58 @@ def load_api_key() -> str:
         f"{key_file} (chmod 600). Create the key in Clockify under "
         "Profile settings > Advanced."
     )
+
+
+class Settings:
+    """Small JSON settings file kept by the MCP.
+
+    {
+      "workspace": "<id>",                    # workspace the tools use
+      "workspaces": {"<id>": {"name": "RISE", "subscription": "BASIC_2021"}}
+    }
+
+    The workspaces part is a copy of what Clockify's /workspaces endpoint
+    returned the last time it was asked; it is not meant to be edited.
+    """
+
+    def __init__(self, path: Path | None):
+        self.path = path
+        self.data: dict[str, Any] = {}
+        if path and path.is_file():
+            try:
+                self.data = json.loads(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError) as exc:
+                raise ClockifyError(f"Could not read the settings file {path}: {exc}") from exc
+
+    def save(self) -> None:
+        if not self.path:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except OSError as exc:
+            raise ClockifyError(f"Could not write the settings file {self.path}: {exc}") from exc
+
+    def subscription_for(self, workspace_id: str | None) -> str | None:
+        return (self.data.get("workspaces") or {}).get(workspace_id or "", {}).get("subscription")
+
+    def record_workspaces(self, workspaces: list[dict[str, Any]]) -> None:
+        self.data["workspaces"] = {
+            w["id"]: {"name": w["name"], "subscription": w["subscription"]} for w in workspaces
+        }
+        self.save()
+
+    def select(self, workspace_id: str) -> None:
+        self.data["workspace"] = workspace_id
+        self.save()
+
+
+def hourly_limit_for(subscription: str | None) -> int | None:
+    """Requests per hour: limited for a free subscription, and also while the
+    subscription is not known yet; no limit for any other subscription."""
+    if subscription is None or subscription.upper().startswith("FREE"):
+        return FREE_PLAN_HOURLY_LIMIT
+    return None
 
 
 class RequestLog:
@@ -124,6 +178,7 @@ class ClockifyClient:
         api_url: str | None = None,
         workspace_id: str | None = None,
         usage_file: Path | None = DEFAULT_USAGE_FILE,
+        config_file: Path | None = DEFAULT_CONFIG_FILE,
         transport: httpx.BaseTransport | None = None,
     ):
         self._http = httpx.Client(
@@ -132,10 +187,14 @@ class ClockifyClient:
             timeout=30.0,
             transport=transport,
         )
-        self._workspace_override = workspace_id or os.environ.get("CLOCKIFY_WORKSPACE_ID")
+        self.settings = Settings(config_file)
+        self._workspace_override = (
+            workspace_id or os.environ.get("CLOCKIFY_WORKSPACE_ID") or self.settings.data.get("workspace")
+        )
         self.requests = RequestLog(usage_file)
         self._user: dict[str, Any] | None = None
         self._projects: list[Project] | None = None
+        self._workspaces: list[dict[str, Any]] | None = None
 
     # -- low level -----------------------------------------------------------
 
@@ -147,10 +206,12 @@ class ClockifyClient:
             raise ClockifyError(f"Could not reach Clockify: {exc}") from exc
         if response.status_code == 429:
             raise ClockifyError(
-                "Clockify rate limit reached (HTTP 429). The free plan can be limited "
-                f"to {FREE_PLAN_HOURLY_LIMIT} requests per hour for the whole workspace; "
-                f"this server has made {self.requests.count()} in the last hour. "
-                "Wait and try again."
+                "Clockify rate limit reached (HTTP 429). The workspace subscription is "
+                f"'{self.subscription or 'not known yet'}'; a free workspace can be limited to "
+                f"{FREE_PLAN_HOURLY_LIMIT} requests per hour. "
+                f"This server has made {self.requests.count()} in the last hour. Wait and try "
+                "again. If the workspace was upgraded, an API key made before the upgrade may "
+                "still be held to the free limit; create a new key."
             )
         if response.status_code == 401:
             raise ClockifyError("Clockify rejected the API key (HTTP 401).")
@@ -187,6 +248,63 @@ class ClockifyClient:
         if not workspace:
             raise ClockifyError("Could not determine the Clockify workspace; set CLOCKIFY_WORKSPACE_ID.")
         return workspace
+
+    def known_workspace_id(self) -> str | None:
+        """The workspace id if it is known without an API request."""
+        if self._workspace_override:
+            return self._workspace_override
+        if self._user:
+            return self._user.get("activeWorkspace") or self._user.get("defaultWorkspace")
+        return None
+
+    @property
+    def subscription(self) -> str | None:
+        """The workspace's subscription type as Clockify last reported it."""
+        return self.settings.subscription_for(self.known_workspace_id())
+
+    @property
+    def hourly_limit(self) -> int | None:
+        return hourly_limit_for(self.subscription)
+
+    def workspaces(self, *, refresh: bool = False) -> list[dict[str, Any]]:
+        """The user's workspaces (one request, then cached). Their names and
+        subscription types are saved in the settings file."""
+        if self._workspaces is None or refresh:
+            items = self._request("GET", "/workspaces") or []
+            self._workspaces = [
+                {
+                    "id": w["id"],
+                    "name": w.get("name", ""),
+                    "subscription": w.get("featureSubscriptionType"),
+                }
+                for w in items
+            ]
+            self.settings.record_workspaces(self._workspaces)
+        return self._workspaces
+
+    def select_workspace(self, workspace: str) -> dict[str, Any]:
+        """Use another workspace from now on, by id or (part of) its name.
+
+        The choice is saved in the settings file. Clockify's own active
+        workspace is not changed.
+        """
+        wanted = workspace.strip().casefold()
+        if not wanted:
+            raise ClockifyError("No workspace given.")
+        options = self.workspaces()
+        match = [w for w in options if w["id"] == workspace.strip()]
+        match = match or [w for w in options if w["name"].casefold() == wanted]
+        match = match or [w for w in options if wanted in w["name"].casefold()]
+        if len(match) != 1:
+            names = ", ".join(f"'{w['name']}'" for w in (match or options)[:10])
+            what = "several" if match else "no"
+            raise ClockifyError(f"'{workspace}' matches {what} workspaces. Choose one of: {names}.")
+        chosen = match[0]
+        if chosen["id"] != self._workspace_override:
+            self._projects = None  # projects belong to a workspace
+        self._workspace_override = chosen["id"]
+        self.settings.select(chosen["id"])
+        return {**chosen, "hourly_limit": self.hourly_limit}
 
     @property
     def tz(self) -> ZoneInfo:
@@ -247,6 +365,59 @@ class ClockifyClient:
             )
         names = ", ".join(f"'{p.name}'" for p in partial[:10])
         raise ClockifyError(f"'{project}' matches several projects: {names}. Be more specific or use the id.")
+
+    def find_client_id(self, name: str) -> str:
+        """Id of the existing client with exactly this name (one request)."""
+        wanted = name.strip().casefold()
+        batch = self._request(
+            "GET",
+            f"/workspaces/{self.workspace_id}/clients",
+            params={"name": name.strip(), "page-size": PAGE_SIZE},
+        )
+        matches = [c for c in batch or [] if (c.get("name") or "").strip().casefold() == wanted]
+        if len(matches) != 1:
+            found = ", ".join(f"'{c.get('name')}'" for c in (batch or [])[:10]) or "none"
+            raise ClockifyError(
+                f"Expected one client named '{name}', found {len(matches)} (similar: {found}). "
+                "Create the client in Clockify first, or leave the client out."
+            )
+        return matches[0]["id"]
+
+    def create_project(
+        self,
+        name: str,
+        *,
+        client: str = "",
+        is_public: bool | None = None,
+        billable: bool | None = None,
+    ) -> Project:
+        """Create a project. Refuses a name that already exists, archived or not."""
+        name = name.strip()
+        if not name:
+            raise ClockifyError("No project name given.")
+        clash = [p for p in self.projects() if p.name.casefold() == name.casefold()]
+        if clash:
+            state = "archived" if clash[0].archived else "active"
+            raise ClockifyError(
+                f"A project named '{clash[0].name}' already exists ({state}, id {clash[0].id})."
+            )
+        body: dict[str, Any] = {"name": name}
+        if client.strip():
+            body["clientId"] = self.find_client_id(client)
+        if is_public is not None:
+            body["isPublic"] = is_public
+        if billable is not None:
+            body["billable"] = billable
+        item = self._request("POST", f"/workspaces/{self.workspace_id}/projects", json=body)
+        project = Project(
+            id=item["id"],
+            name=item.get("name", name),
+            client=item.get("clientName") or client.strip(),
+            archived=bool(item.get("archived")),
+        )
+        if self._projects is not None:
+            self._projects.append(project)
+        return project
 
     def project_name(self, project_id: str | None) -> str:
         if not project_id:
